@@ -18,7 +18,7 @@ if "%ERRORLEVEL%"=="0" (
     echo Armagetronad is running.
 ) else (
     echo Armagetronad is not running.
-    timeout /t 10 > NUL
+    timeout /t 1 > NUL
     call :Update
 )
 
@@ -27,9 +27,12 @@ set /a "counter+=1"
 goto loop
 
 :ConnectVPN
+    echo. > "C:\Users\itsne\Desktop\arma_chatbot_config\openvpn.log"
+    taskkill /F /FI "WINDOWTITLE eq OpenVPNConnection" 2>NUL
     set CONNECTING_TO_VPN=1
+
     taskkill /F /IM openvpn.exe 2>NUL
-    timeout /t 5 > NUL
+    timeout /t 2 > NUL
 
     set OVPN_DIR=C:\Users\itsne\Desktop\arma_chatbot_config\VPN\OVPN
     set /a "count=0"
@@ -40,11 +43,37 @@ goto loop
 
     set /a "randIndex=(%random% %% count) + 1"
     set "randFile=!file[%randIndex%]!"
-    start "" %OPENVPN_PATH% --config "!randFile!" > "C:\Users\itsne\Desktop\arma_chatbot_config\openvpn.log" 2>&1
 
-    timeout /t 30 > NUL
+    start "OpenVPNConnection" cmd /c "%OPENVPN_PATH% --config "!randFile!" > "C:\Users\itsne\Desktop\arma_chatbot_config\openvpn.log" 2>&1"
+
+    REM wait for VPN to connect
+    set VPN_CONNECTED=0
+    for /L %%x in (1,1,6) do (  REM try for up to 6 times with a 5 sec interval to 30 seconds
+        timeout /t 5 > NUL
+        findstr /C:"Initialization Sequence Completed" "C:\Users\itsne\Desktop\arma_chatbot_config\openvpn.log" > NUL
+        if !errorlevel! == 0 (
+            set VPN_CONNECTED=1
+            goto VPNConnected
+        )
+        REM check for auth fail
+        findstr /C:"AUTH: Received control message: AUTH_FAILED" "C:\Users\itsne\Desktop\arma_chatbot_config\openvpn.log" > NUL
+        if !errorlevel! == 0 (
+            echo Authentication failure detected. Retrying...
+            taskkill /F /FI "WINDOWTITLE eq OpenVPNConnection" 2>NUL
+            taskkill /F /IM openvpn.exe 2>NUL
+            REM try to reconnect 
+            goto ConnectVPN
+        )
+    )
+
+:VPNConnected
+    if !VPN_CONNECTED! == 0 (
+        echo VPN connection failed or took too long.
+    )
+
     set CONNECTING_TO_VPN=0
 exit /b
+
 
 :CheckVPN
     if "%CONNECTING_TO_VPN%"=="1" (

@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 
 set OPENVPN_PATH="C:\Program Files\OpenVPN\bin\openvpn.exe"
-set REAL_IP=""
+set REAL_IP="73.43.187.7"
 set CONNECTING_TO_VPN=0
 set /a "counter=0"
 
@@ -27,10 +27,11 @@ set /a "counter+=1"
 goto loop
 
 :ConnectVPN
+    REM Clear the log file before connecting again
     echo. > "C:\Users\itsne\Desktop\arma_chatbot_config\openvpn.log"
     taskkill /F /FI "WINDOWTITLE eq OpenVPNConnection" 2>NUL
     set CONNECTING_TO_VPN=1
-
+    REM Kill any previous OpenVPN processes
     taskkill /F /IM openvpn.exe 2>NUL
     timeout /t 2 > NUL
 
@@ -43,32 +44,33 @@ goto loop
 
     set /a "randIndex=(%random% %% count) + 1"
     set "randFile=!file[%randIndex%]!"
-
+    REM Using a unique title "OpenVPNConnection" for the command prompt window
     start "OpenVPNConnection" cmd /c "%OPENVPN_PATH% --config "!randFile!" > "C:\Users\itsne\Desktop\arma_chatbot_config\openvpn.log" 2>&1"
 
-    REM wait for VPN to connect
+    REM Wait for VPN to connect by monitoring the log file
     set VPN_CONNECTED=0
-    for /L %%x in (1,1,6) do (  REM try for up to 6 times with a 5 sec interval to 30 seconds
+    for /L %%x in (1,1,6) do (  REM Try for up to 6 times (with a 5-second interval, that's up to 30 seconds)
         timeout /t 5 > NUL
         findstr /C:"Initialization Sequence Completed" "C:\Users\itsne\Desktop\arma_chatbot_config\openvpn.log" > NUL
         if !errorlevel! == 0 (
             set VPN_CONNECTED=1
             goto VPNConnected
         )
-        REM check for auth fail
+        REM Check for authentication failure
         findstr /C:"AUTH: Received control message: AUTH_FAILED" "C:\Users\itsne\Desktop\arma_chatbot_config\openvpn.log" > NUL
         if !errorlevel! == 0 (
             echo Authentication failure detected. Retrying...
             taskkill /F /FI "WINDOWTITLE eq OpenVPNConnection" 2>NUL
             taskkill /F /IM openvpn.exe 2>NUL
-            REM try to reconnect 
+            REM Try to reconnect (You may want to limit the number of retries to avoid infinite loops)
             goto ConnectVPN
         )
     )
 
 :VPNConnected
     if !VPN_CONNECTED! == 0 (
-        echo VPN connection failed or took too long.
+        echo VPN connection failed or took too long. Please check.
+        REM You can add any additional handling for VPN connection failures here.
     )
 
     set CONNECTING_TO_VPN=0
@@ -122,6 +124,16 @@ rmdir /s /q "C:\Users\itsne\Desktop\dist" 2>NUL
 
 echo Copying new dist folder
 xcopy "\\tsclient\C\Games\ArmagetronProject2.0\dist" "C:\Users\itsne\Desktop\dist" /E /I /Y
+
+:GenerateTimestamp
+for /f "delims=" %%a in ('wmic OS Get localdatetime ^| find "."') do set datetime=%%a
+set timestamp=%datetime:~0,4%-%datetime:~4,2%-%datetime:~6,2%-%datetime:~8,2%%datetime:~10,2%%datetime:~12,2%
+exit /b
+
+call :GenerateTimestamp
+
+echo Creating backup of stats.db...
+copy "C:\Users\itsne\AppData\Roaming\Armagetron\var\stats.db" "C:\Users\itsne\Desktop\arma_chatbot_config\Backups\stats-%timestamp%.db"
 
 :StartGame
 echo Running new Armagetronad

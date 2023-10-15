@@ -1,8 +1,29 @@
 @echo off
 setlocal EnableDelayedExpansion
+@echo off
+:: Check for admin privileges
+net session >nul 2>&1
+if %errorLevel% == 0 (
+    echo Running as administrator.
+) else (
+    echo Not running as administrator. Trying to elevate...
+    goto UACPrompt
+)
+
+:: If the script has admin rights, continue with the rest of the script
+goto startScript
+
+:UACPrompt
+    echo Set UAC = CreateObject^("Shell.Application"^) > "%temp%\getadmin.vbs"
+    echo UAC.ShellExecute "%~s0", "", "", "runas", 1 >> "%temp%\getadmin.vbs"
+
+    "%temp%\getadmin.vbs"
+    exit /B
+
+:startScript
 
 set OPENVPN_PATH="C:\Program Files\OpenVPN\bin\openvpn.exe"
-set REAL_IP="73.43.187.7"
+set REAL_IP=""
 set CONNECTING_TO_VPN=0
 set /a "counter=0"
 
@@ -27,11 +48,10 @@ set /a "counter+=1"
 goto loop
 
 :ConnectVPN
-    REM Clear the log file before connecting again
     echo. > "C:\Users\itsne\Desktop\arma_chatbot_config\openvpn.log"
     taskkill /F /FI "WINDOWTITLE eq OpenVPNConnection" 2>NUL
     set CONNECTING_TO_VPN=1
-    REM Kill any previous OpenVPN processes
+
     taskkill /F /IM openvpn.exe 2>NUL
     timeout /t 2 > NUL
 
@@ -44,33 +64,32 @@ goto loop
 
     set /a "randIndex=(%random% %% count) + 1"
     set "randFile=!file[%randIndex%]!"
-    REM Using a unique title "OpenVPNConnection" for the command prompt window
+
     start "OpenVPNConnection" cmd /c "%OPENVPN_PATH% --config "!randFile!" > "C:\Users\itsne\Desktop\arma_chatbot_config\openvpn.log" 2>&1"
 
-    REM Wait for VPN to connect by monitoring the log file
+    REM wait for VPN to connect
     set VPN_CONNECTED=0
-    for /L %%x in (1,1,6) do (  REM Try for up to 6 times (with a 5-second interval, that's up to 30 seconds)
+    for /L %%x in (1,1,6) do (  REM try for up to 6 times with a 5 sec interval to 30 seconds
         timeout /t 5 > NUL
         findstr /C:"Initialization Sequence Completed" "C:\Users\itsne\Desktop\arma_chatbot_config\openvpn.log" > NUL
         if !errorlevel! == 0 (
             set VPN_CONNECTED=1
             goto VPNConnected
         )
-        REM Check for authentication failure
+        REM check for auth fail
         findstr /C:"AUTH: Received control message: AUTH_FAILED" "C:\Users\itsne\Desktop\arma_chatbot_config\openvpn.log" > NUL
         if !errorlevel! == 0 (
             echo Authentication failure detected. Retrying...
             taskkill /F /FI "WINDOWTITLE eq OpenVPNConnection" 2>NUL
             taskkill /F /IM openvpn.exe 2>NUL
-            REM Try to reconnect (You may want to limit the number of retries to avoid infinite loops)
+            REM try to reconnect 
             goto ConnectVPN
         )
     )
 
 :VPNConnected
     if !VPN_CONNECTED! == 0 (
-        echo VPN connection failed or took too long. Please check.
-        REM You can add any additional handling for VPN connection failures here.
+        echo VPN connection failed or took too long.
     )
 
     set CONNECTING_TO_VPN=0

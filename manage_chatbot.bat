@@ -27,12 +27,12 @@ set REAL_IP=""
 set CONNECTING_TO_VPN=0
 set /a "counter=0"
 
-:loop
 if !counter! geq 10 (
-    cls
+    echo.
+    echo ------------------ LOOP WRAP ------------------
+    for /L %%i in (1,1,20) do echo.  REM adds 20 blank lines
     set /a "counter=0"
 )
-
 
 tasklist /FI "IMAGENAME eq armagetronad.exe" 2>NUL | find /I /N "armagetronad.exe">NUL
 if "%ERRORLEVEL%"=="0" (
@@ -64,6 +64,8 @@ goto loop
 
     set /a "randIndex=(%random% %% count) + 1"
     set "randFile=!file[%randIndex%]!"
+
+    echo Using VPN configuration file: !randFile!
 
     start "OpenVPNConnection" cmd /c "%OPENVPN_PATH% --config "!randFile!" > "C:\Users\itsne\Desktop\arma_chatbot_config\openvpn.log" 2>&1"
 
@@ -110,7 +112,7 @@ exit /b
         echo Not connected to a VPN. Connecting...
         call :ConnectVPN
     ) else (
-        echo Connected to a VPN.
+        echo Connected to a VPN. (%CURRENT_IP%)
     )
 exit /b
 

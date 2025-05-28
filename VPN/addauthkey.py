@@ -1,10 +1,10 @@
 import os
 
 # directory containing the .ovpn 
-vpn_dir = r"C:\Users\itsne\Desktop\arma_chatbot_config\VPN\OVPN"
+vpn_dir = r"C:\Games\ArmagetronProject2.0\arma_chatbot_config\VPN\OVPN"
 
 # path to the credentials 
-credentials_file = r"C:\\Users\\itsne\Desktop\\arma_chatbot_config\\VPN\\mycredentials.txt"
+credentials_file = r"C:\\Users\\itsne\\Desktop\\arma_chatbot_config\\VPN\\mycredentials.txt"
 
 
 for filename in os.listdir(vpn_dir):

@@ -34,6 +34,14 @@ except Exception as e:
     logging.error(f"Error retrieving configuration values: {e}")
     sys.exit(1)
 
+IP_SERVICES = [
+    'https://httpbin.org/ip',               # returns {"origin": "x.x.x.x"}
+    'https://api.ipify.org?format=json',    # returns {"ip": "x.x.x.x"}
+    'https://ipinfo.io/json',               # returns {"ip": "x.x.x.x", ...}
+    'https://icanhazip.com',                # returns plain text "x.x.x.x\n"
+    'https://checkip.amazonaws.com'         # returns plain text "x.x.x.x\n"
+]
+
 
 log_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S")
 
@@ -328,20 +336,33 @@ def wait_for_vpn_initialization(log_path, timeout=30, interval=1):
     logging.warning("Timeout reached waiting for VPN initialization.")
     return False
 
+def fetch_ip_from_service(url):
+    try:
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        if url.endswith('/ip'):
+            return resp.json()['origin'].strip()
+        elif 'ipify' in url or 'ipinfo' in url:
+            return resp.json()['ip'].strip()
+        else:
+            return resp.text.strip()
+    except Exception as e:
+        logging.warning(f"Failed to get IP from {url}: {e}")
+        return None
+
 def get_current_ip(real_ip, retry_interval=1, max_retries=30):
     retries = 0
     while retries < max_retries:
-        try:
-            resp = requests.get('https://httpbin.org/ip', timeout=5)
-            current_ip = resp.json()['origin'].strip()
-            logging.info(f"Fetched IP: {current_ip}")
-            if current_ip != real_ip:
+        for service in IP_SERVICES:
+            current_ip = fetch_ip_from_service(service)
+            if current_ip and current_ip != real_ip:
+                logging.info(f"Fetched new IP: {current_ip} from {service}")
                 return current_ip
-            logging.warning("Current IP still matches REAL_IP. Waiting for new IP...")
-        except Exception as e:
-            logging.error(f"Error fetching IP (retrying): {e}")
+            elif current_ip == real_ip:
+                logging.warning(f"IP from {service} still matches REAL_IP. Retrying...")
         time.sleep(retry_interval)
         retries += 1
+    logging.error("Max retries reached. Failed to get a new IP.")
     return None
 
 def connect_until_new_ip(real_ip, banned_ip=None):

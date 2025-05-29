@@ -6,6 +6,8 @@ import textwrap
 import configparser
 import logging
 import sys
+import pyperclip
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -18,10 +20,11 @@ except Exception as e:
     sys.exit(1)
 
 try:
-    CONSOLE_LOG       = config.get('Paths',    'console_log')
-    COMMANDS_FILE     = config.get('Paths',    'commands_file')
-    COMMAND_PREFIX    = config.get('Settings', 'command_prefix')
-    MAX_LOG_LINES     = config.getint('Settings', 'max_log_lines', fallback=1000)
+    CONSOLE_LOG     = config.get('Paths',    'console_log')
+    COMMANDS_FILE   = config.get('Paths',    'commands_file')
+    COMMAND_PREFIX  = config.get('Settings', 'command_prefix')
+    MAX_LOG_LINES   = config.getint('Settings', 'max_log_lines', fallback=1000)
+    CLEAR_KEY       = config.get('Settings', 'clear_key', fallback='clear')
 except Exception as e:
     logging.error(f"Error retrieving config values: {e}")
     sys.exit(1)
@@ -149,11 +152,25 @@ def draw_screen(stdscr, lines, lock):
             scroll_offset = 0
             continue
 
+        if ch == curses.KEY_F2:
+            with lock:
+                pyperclip.copy('\n'.join(lines))
+                lines.append("→ COPIED entire log buffer to clipboard.")
+            continue
+
         if ch == curses.KEY_MOUSE:
             try:
                 _, mx, my, _, bstate = curses.getmouse()
                 if bstate & curses.BUTTON1_PRESSED:
-                    if 1 <= my < log_h - 1 and mx == width - 2:
+                    if 1 <= my < log_h - 1 and mx < width - 3:
+                        visible_y = my - 1
+                        line_index = start_idx + visible_y
+                        if line_index < len(wrapped):
+                            text = wrapped[line_index]
+                            pyperclip.copy(text)
+                            with lock:
+                                lines.append(f"→ COPIED line to clipboard: {text}")
+                    elif 1 <= my < log_h - 1 and mx == width - 2:
                         dragging = True
                         drag_start_y = my
                         drag_start_offset = scroll_offset
@@ -190,17 +207,24 @@ def draw_screen(stdscr, lines, lock):
             if cmd.lower() in ("exit", "quit"):
                 return
             full_cmd = f"{COMMAND_PREFIX} {cmd}" if COMMAND_PREFIX else cmd
-            try:
-                with open(COMMANDS_FILE, 'a', encoding='utf-8') as f:
-                    f.write(full_cmd + "\n")
-                    f.flush()
-                    os.fsync(f.fileno())
-            except Exception as e:
+        
+            if cmd == CLEAR_KEY:
                 with lock:
-                    lines.append(f"→ ERROR writing command: {e}")
+                    lines.clear()
+                    lines.append("→ CLEARED log buffer.")
             else:
-                with lock:
-                    lines.append(f"→ SENT: {full_cmd}")
+                try:
+                    with open(COMMANDS_FILE, 'a', encoding='utf-8') as f:
+                        f.write(full_cmd + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                except Exception as e:
+                    with lock:
+                        lines.append(f"→ ERROR writing command: {e}")
+                else:
+                    with lock:
+                        lines.append(f"→ SENT: {full_cmd}")
+
         elif ch in (curses.KEY_EXIT, '\x1b'):
             return
 

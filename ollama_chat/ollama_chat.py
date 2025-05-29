@@ -97,7 +97,10 @@ parameters = {
     "context_builder_max_lines": 10,
     "context_builder_prompt": "",
     "context_builder_prompt_post": "",
-    "process_lines_containing": ["thomas,big"]
+    "process_lines_containing": ["thomas,big"],
+    "smart_processor": True,
+    "smart_processor_active_players": 1,
+    "spam_maxlen": 150,
 
 }
 
@@ -127,7 +130,7 @@ def get_default_history():
         }
     ]
 
-def load_context_builder_lines():
+def load_context_builder_lines(update_tracker=True):
     last_line_index = 0
     if os.path.exists(CONTEXT_LAST_LINE_TRACKER):
         with open(CONTEXT_LAST_LINE_TRACKER, "r") as f:
@@ -142,12 +145,18 @@ def load_context_builder_lines():
     with open(CONTEXT_BUILDER_DATA, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
 
-    new_lines = [line.strip() for line in lines[last_line_index:] if line.strip()]
+    new_lines = [
+        line.strip().replace("epixxware.com", "The CLASSIC Submarine")
+        for line in lines[last_line_index:]
+        if line.strip()
+    ]
 
-    with open(CONTEXT_LAST_LINE_TRACKER, "w") as f:
-        f.write(str(len(lines)))
+    if update_tracker:
+        with open(CONTEXT_LAST_LINE_TRACKER, "w") as f:
+            f.write(str(len(lines)))
 
     return new_lines
+
 
 def load_all_contexts():
     printlog(f"\n🧠 Looking for contexts in: {os.path.abspath(CONTEXT_DIR)}")
@@ -445,7 +454,7 @@ def cleanse_text(command, text):
 def output_response(command, response, bypass_processing=False):
     cleansed_response = cleanse_text(command, response)
 
-    max_len = 150
+    max_len = parameters.get("spam_maxlen", 150)
     words = cleansed_response.split()
     chunks = []
     current_chunk = ""
@@ -462,23 +471,40 @@ def output_response(command, response, bypass_processing=False):
     output_lines = []
     total_delay = 0.0
 
+    printlog("📤 Outputting response chunks (cleaned):")
+    for i, chunk in enumerate(chunks):
+        if not chunk.strip():
+            continue
+        printlog(chunk)
+
     if not bypass_processing:
         time_taken_to_process = time.time() - initialization_time
+        simualated_items = ""
 
-        if parameters["reading_wpm_speed"] > 0:
-            reading_time = calculate_wpm_time(command, parameters["reading_wpm_speed"])
+        if parameters.get("reading_wpm_speed", 0) > 0 or parameters.get("typing_wpm_speed", 0) > 0:
+            simualated_items = "Simulated: "
+            
+        if parameters.get("reading_wpm_speed", 0) > 0:
+            reading_time = calculate_wpm_time(command, parameters.get("reading_wpm_speed", 0))
             additional_sleep_time = reading_time - time_taken_to_process
             if additional_sleep_time > 0 and "*EVENT" not in command:
-                printlog(f"\nSimulating {additional_sleep_time:.2f}s reading delay.")
+                simualated_items += (f"{additional_sleep_time:.2f}s reading delay. ")
                 total_delay += additional_sleep_time
 
-        if parameters["typing_wpm_speed"] > 0:
-            typing_time = calculate_wpm_time(cleansed_response, parameters["typing_wpm_speed"])
-            printlog(f"\nSimulating {typing_time:.2f}s typing delay.")
+        if parameters.get("typing_wpm_speed", 0) > 0:
+            typing_time = calculate_wpm_time(cleansed_response, parameters.get("typing_wpm_speed", 0))
+            simualated_items += (f"{additional_sleep_time:.2f}s typing delay. ")
             total_delay += typing_time
+        
+        if simualated_items != "Simulated: ":
+            printlog(f"{simualated_items}\n")
 
     delay_per_chunk = total_delay / max(1, len(chunks))
-    printlog("\nOutputting response chunks:")
+
+    if parameters.get("chatbot_processing", False) and parameters.get("local_mode", False):
+        printlog("\nSetting all chatting to 1")
+        with open(OUTPUT_FILE, 'a', encoding='utf-8') as f:
+            f.write("SET_ALL_CHATTING 1\n")
 
     last_delay = round(total_delay, 2) 
 
@@ -489,13 +515,12 @@ def output_response(command, response, bypass_processing=False):
         delay_seconds = round(total_delay + delay_per_chunk * i, 2)
         last_delay = delay_seconds  
         line = f'DELAY_COMMAND {delay_seconds:.2f} {parameters.get("prefix_text","")} {chunk}'
-        printlog(f"→ {line}")
         output_lines.append(line)
 
-    if parameters["chatbot_processing"] and parameters["local_mode"]:
-        printlog(f"\nDelaying SET_ALL_CHATTING 0 by {last_delay:.2f}s")
+    if parameters.get("chatbot_processing", False) and parameters.get("local_mode", False):
         output_lines.append(f'DELAY_COMMAND {last_delay:.2f} SET_ALL_CHATTING 0')
 
+    printlog("Sending commands to OUTPUT_FILE: " + "\n".join(output_lines) )
     with open(OUTPUT_FILE, 'a', encoding='utf-8') as file:
         file.write("\n".join(output_lines) + "\n")
 
@@ -530,13 +555,7 @@ def parse_setting_change(command):
             "*==settingchange==* params <key> <value> … "
             f"Available parameters: {available}"
         )
-
-        max_len = 151
-        chunks  = [help_msg[i:i+max_len] for i in range(0, len(help_msg), max_len)]
-        with open(OUTPUT_FILE, 'a', encoding='utf-8') as f:
-            for idx, chunk in enumerate(chunks, 1):               
-                f.write(f'DELAY_COMMAND {idx:.2f} {parameters.get("prefix_text","")} {chunk}\n')
-
+        output_response(command, help_msg, bypass_processing=True)
         printlog(help_msg)
         return {}
 
@@ -547,7 +566,7 @@ def parse_setting_change(command):
             return []
         joined = ' '.join(seq)
         if joined.startswith('[') and joined.endswith(']'):
-            joined = joined[1:-1]       
+            joined = joined[1:-1]
         return [n.strip().strip(',') for n in joined.split(',') if n.strip()]
 
     if cmd in ("add_process_player", "remove_process_player", "toggle_process_player"):
@@ -555,7 +574,9 @@ def parse_setting_change(command):
         before = list(parameters.get("always_processed_players", []))
 
         if not names:
-            printlog(f"No player names provided for {cmd}.")
+            msg = f"No player names provided for {cmd}."
+            printlog(msg)
+            output_response(command, msg, bypass_processing=True)
             return {}
 
         for name in names:
@@ -565,18 +586,16 @@ def parse_setting_change(command):
             elif cmd == "remove_process_player":
                 if name in parameters["always_processed_players"]:
                     parameters["always_processed_players"].remove(name)
-            else:  
+            else: 
                 if name in parameters["always_processed_players"]:
                     parameters["always_processed_players"].remove(name)
                 else:
                     parameters["always_processed_players"].append(name)
 
         after  = list(parameters.get("always_processed_players", []))
-        #status = f"{cmd.replace('_', ' ').title()} | before: {before}, after: {after}"
         status = f"{cmd.replace('_', ' ').title()} after: {after}"
         printlog(status)
-        with open(OUTPUT_FILE, 'a', encoding='utf-8') as f:
-            f.write(f'{parameters.get("prefix_text","")} {status}\n')
+        output_response(command, status, bypass_processing=True)
         return {"always_processed_players": after}
 
     updates, i, n = {}, 0, len(tokens)
@@ -590,8 +609,7 @@ def parse_setting_change(command):
             updates['initial_prompt']    = new
             status = f"initial_prompt changed from \"{old}\" to \"{new}\"."
             printlog(status)
-            with open(OUTPUT_FILE, 'a', encoding='utf-8') as f:
-                f.write(f'{parameters.get("prefix_text","")} {status}\n')
+            output_response(command, status, bypass_processing=True)
             break
 
         if i + 1 < n:
@@ -602,19 +620,15 @@ def parse_setting_change(command):
             updates[key]    = new
             status = f"{key} changed from {old} to {new}."
             printlog(status)
-            with open(OUTPUT_FILE, 'a', encoding='utf-8') as f:
-                f.write(f'{parameters.get("prefix_text","")} {status}\n')
+            output_response(command, status, bypass_processing=True)
             i += 2
         else:
             status = f"{key} is currently set to {parameters.get(key, '<unknown>')}."
             printlog(status)
-            with open(OUTPUT_FILE, 'a', encoding='utf-8') as f:
-                f.write(f'{parameters.get("prefix_text","")} {status}\n')
+            output_response(command, status, bypass_processing=True)
             i += 1
 
     return updates
-
-
 
 def update_params_file(file_path, updates):
     lines = []
@@ -663,39 +677,103 @@ def update_params_file(file_path, updates):
     outputRes = (f"Applied setting changes: {updates}")
     printlog(outputRes)
 
+
+def apply_context_builder(input_text: str) -> str:
+    if not parameters.get("use_context_builder", False):
+        return input_text
+
+    context_lines = load_context_builder_lines()
+    if not context_lines:
+        return input_text
+
+    max_lines = parameters.get("context_builder_max_lines", 10)
+    limited_context = context_lines[-max_lines:]
+    context_block = "\n".join(limited_context)
+
+    printlog(f"\n📚 Injecting {len(limited_context)} context builder line(s):\n{context_block}")
+
+    return (
+        f"{parameters.get('context_builder_prompt', '')}\n"
+        f"{context_block}\n"
+        f"{parameters.get('context_builder_prompt_post', '')}\n"
+        f"{input_text}"
+    )
+
+def apply_rag(input_text: str) -> str:
+    if input_text.startswith("*EVENT"):
+        return input_text
+
+    query = input_text.partition(":")[2].strip()
+    if not (query.startswith("@@") or query.endswith("?")):
+        return input_text
+
+    matches = search_all_contexts(query, top_k=1)
+    if not matches:
+        return input_text
+
+    rag_context = "\n\n".join(f"[{ctx}] {text}" for ctx, text, _ in matches)
+    printlog("\n📚 Injecting RAG context:\n" + rag_context)
+
+    return (
+        f"{input_text}\n\n"
+        f"{parameters['rag_prompt']}\n"
+        f"{rag_context}"
+    )
+
 def process_line(line) -> bool:
     global history
+    processing_reason = None
+    smart_override = False
+
+    if parameters.get("smart_processor", False):
+        try:
+            context_lines = load_context_builder_lines(update_tracker=False)
+            for cline in reversed(context_lines):
+                if "Round ended." in cline or "Round started." in cline:
+                    match_total = re.search(r'Player Count: (\d+)', cline)
+                    match_specs = re.search(r'Spectator Count: (\d+)', cline)
+                    if match_total and match_specs:
+                        total = int(match_total.group(1))
+                        specs = int(match_specs.group(1))
+                        active = total - specs
+                        threshold = parameters.get("smart_processor_active_players", 1)
+                        if active <= threshold:
+                            smart_override = True
+                            processing_reason = f"Smart override (active={active} <= threshold={threshold})"
+                            printlog(f"🔓 SMART OVERRIDE ACTIVE — {processing_reason}")
+                        else:
+                            printlog(f"🚫 SMART OVERRIDE SKIPPED (active={active}, threshold={threshold})")
+                    break
+        except Exception as e:
+            printlog(f"⚠️ Smart processor failed to parse context lines: {e}")
 
     line = line.lstrip()
-    
+
     if "-->" in line[:35]:
         colon_index = line.find(":")
         if colon_index != -1:
             content = line[colon_index + 1:].strip().lower()
-
-            has_keyword = any(
-                keyword.lower() in content for keyword in parameters.get("process_lines_containing", [])
-            )
-
-            has_prefix = any(
-                content.startswith(pref.lower()) for pref in parameters.get("command_prefix", [])
-            )
-
+            has_keyword = any(keyword.lower() in content for keyword in parameters.get("process_lines_containing", []))
+            has_prefix = any(content.startswith(pref.lower()) for pref in parameters.get("command_prefix", []))
             if not (has_keyword or has_prefix):
                 return False
 
-
     if line.startswith("*EVENT"):
-        command = line
+        processing_reason = "Event line"
+        ollama_input = line
+
     else:
         if "*==settingchange==*" in line:
             updates = parse_setting_change(line)
             if updates:
                 update_params_file(PARAMS_FILE, updates)
                 extract_parameters()
+                printlog("🔧 Line processed due to setting change.")
             return True
+
         if ':' not in line:
             return False
+
         sender, _, rest = line.partition(':')
         rest = rest.lstrip()
 
@@ -704,15 +782,14 @@ def process_line(line) -> bool:
 
         lw = rest.lower()
         for prefix in parameters.get("ignore_words_starts_with", []):
-            if prefix and lw.startswith(prefix.lower()):
+            if lw.startswith(prefix.lower()):
                 return False
         for word in parameters.get("ignore_words_exact", []):
-            if word and lw == word.lower():
+            if lw == word.lower():
                 return False
         for substr in parameters.get("ignore_words_contains", []):
-            if substr and substr.lower() in lw:
+            if substr.lower() in lw:
                 return False
-
 
         if ": !!reset" in line:
             extract_parameters()
@@ -720,61 +797,43 @@ def process_line(line) -> bool:
             with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
                 json.dump(history, f, indent=4)
             output_response(line, "History cleared.", bypass_processing=True)
+            printlog("🔁 History reset command processed.")
             return True
-        
-        force_process = False
-        for keyword in parameters.get("process_lines_containing", []):
-            if keyword.lower() in line.lower():
-                force_process = True
-                break
 
-        if parameters.get("process_all_lines", False) or sender in parameters.get("always_processed_players", []) or force_process:
-            command = line
+        if parameters.get("process_all_lines", False):
+            processing_reason = "process_all_lines is enabled"
+            ollama_input = line
+        elif sender in parameters.get("always_processed_players", []):
+            processing_reason = f"Sender '{sender}' is in always_processed_players"
+            ollama_input = line
+        elif any(keyword.lower() in line.lower() for keyword in parameters.get("process_lines_containing", [])):
+            processing_reason = "Matched keyword in process_lines_containing"
+            ollama_input = line
+        elif smart_override:
+            ollama_input = line 
         else:
             matched = None
             for pref in parameters.get("command_prefix", []):
                 if rest.startswith(pref):
                     matched = pref
                     break
-            if not matched:
+            if matched:
+                processing_reason = f"Matched command prefix '{matched}'"
+                msg = rest[len(matched):].lstrip()
+                ollama_input = f"{sender}: {msg}"
+            else:
                 return False
-            msg = rest[len(matched):].lstrip()
-            command = f"{sender}: {msg}"
 
+    if processing_reason:
+        printlog(f"✅ Line is being processed because: {processing_reason}")
 
+    ollama_input = apply_context_builder(ollama_input)
+    ollama_input = apply_rag(ollama_input)
 
-    rag_context = ""
-    if not command.startswith("*EVENT"):
-        query = command.partition(":")[2].strip()
-        if query.startswith("@@")  or query.endswith("?"):# or any(w in query.lower() for w in ["how", "what", "why", "when", "where"]):
-            matches = search_all_contexts(query, top_k=1)
-            if matches:
-                rag_context = "\n\n".join(f"[{ctx}] {text}" for ctx, text, _ in matches)
-                printlog("\n📚 Injecting RAG context:\n" + rag_context)
+    printlog("🔷Final ollama_input:\n" + ollama_input)
 
-    if rag_context:
-        command = (
-            f"{command}\n\n"
-            f"{parameters['rag_prompt']}\n"
-            f"{rag_context}"
-        )
-
-
-    if parameters.get("use_context_builder", False):
-        context_lines = load_context_builder_lines()
-        max_lines = parameters.get("context_builder_max_lines", 10)
-
-        if context_lines:
-            limited_context = context_lines[-max_lines:] 
-            context_block = "\n".join(limited_context)
-            printlog(f"\n📚 Injecting {len(limited_context)} context builder line(s):\n" + context_block)
-            command = f"\n{parameters.get("context_builder_prompt", '')}\n{context_block}\n{parameters.get('context_builder_prompt_post', '')}\n{command}"
-
-
-    printlog("🔷Final command:\n" + command)
-    response = send_to_ollama(command)
-
-    chat_mode = not command.startswith("*EVENT")
+    response = send_to_ollama(ollama_input)
+    chat_mode = not ollama_input.startswith("*EVENT")
 
     if parameters.get("announce_status", False):
         printlog("Got Response:\n" + json.dumps(response, indent=4))
@@ -786,24 +845,19 @@ def process_line(line) -> bool:
 
     printlog(
         f"\nProcess complete\n"
-        f" - total duration: {total_s}\n"
-        f" - tokens in prompt: {tokens_in_prompt}\n"
+        f" - total duration:     {total_s}\n"
+        f" - tokens in prompt:   {tokens_in_prompt}\n"
         f" - tokens in response: {tokens_in_response}\n"
-        f" - response: {ollama_response}"
+        f" - response:           {ollama_response.replace('\r\n', '\n').replace('\n', ' ')}"
     )
 
     if chat_mode:
-        update_history(command, ollama_response)
+        update_history(ollama_input, ollama_response)
     else:
-        evt = command.replace("*EVENT", "").strip()
+        evt = ollama_input.replace("*EVENT", "").strip()
         update_history(evt, ollama_response)
 
-    if parameters.get("chatbot_processing", False) and parameters.get("local_mode", False):
-        printlog("\nSetting all chatting to 1")
-        with open(OUTPUT_FILE, 'a', encoding='utf-8') as f:
-            f.write("SET_ALL_CHATTING 1\n")
-
-    output_response(command, ollama_response)
+    output_response(ollama_input, ollama_response)
     return True
 
 MAX_WORDS = 200
@@ -1082,6 +1136,7 @@ def main():
             last_offset = f.tell()
 
         for line in new_lines:
+
             if line.startswith("*==settingchange==*"):
                 printlog(f"\n{header_bar}\n{get_timestamp()}Processing setting change:\n{line}")
                 process_line(line)

@@ -306,7 +306,31 @@ def connect_vpn_filtered(vpn_path, ovpn_dir, log_path):
             logging.warning("All ovpn files are banned; using one anyway.")
             available_ovpn_files = all_ovpn_files
 
-        rand_file = random.choice(available_ovpn_files)
+        try:
+            preferred_regions_raw = config.get('Settings', 'preferred_regions')
+            preferred_regions = [region.strip().lower() for region in preferred_regions_raw.split(',') if region.strip()]
+        except Exception as e:
+            logging.warning(f"Error loading preferred regions from INI: {e}")
+            preferred_regions = []
+
+        def get_region_rank(filename):
+            basename = os.path.basename(filename).lower()
+            for i, region in enumerate(preferred_regions):
+                if basename.startswith(region):
+                    return i  
+            return len(preferred_regions)  
+
+        available_ovpn_files.sort(key=get_region_rank)
+
+        ranked_groups = {}
+        for f in available_ovpn_files:
+            rank = get_region_rank(f)
+            ranked_groups.setdefault(rank, []).append(f)
+
+        best_rank = min(ranked_groups)
+        candidates = ranked_groups[best_rank]
+        rand_file = random.choice(candidates)
+
         logging.info(f"Using VPN configuration file: {rand_file}")
         
         proc = subprocess.Popen(

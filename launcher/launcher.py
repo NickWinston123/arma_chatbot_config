@@ -15,12 +15,14 @@ config = configparser.ConfigParser()
 ini_path = os.path.join(os.path.dirname(__file__), 'launcher_real.ini')
 try:
     config.read(ini_path)
+
+    CONFIG_DIR = os.path.normpath(config.get('Paths', 'config_dir'))
+    LOG_FILE   = os.path.normpath(config.get('Paths', 'log_file'))
+    
+    ENABLE_UPDATER = config.getboolean('Settings', 'enable_updater', fallback=True)
 except Exception as e:
     logging.error(f"Error reading configuration: {e}")
     sys.exit(1)
-
-CONFIG_DIR = config.get('Paths', 'config_dir')
-LOG_FILE   = config.get('Paths', 'log_file')
 
 raw_excl = config.get('Settings', 'exclude_keywords').strip()
 if raw_excl.startswith('[') and raw_excl.endswith(']'):
@@ -93,10 +95,13 @@ def find_window(alias_list):
             return hwnd
 
     if alias_list == ["game_manager"]:
+        dynamic_vpn_path = os.path.join(CONFIG_DIR, 'vpn', 'ovpn')
+        vpn_path_match = normalize(dynamic_vpn_path)
+        
         for hwnd, title in enum_windows():
             n = normalize(title)
-            if n.startswith("[c:\\users\\itsne\\desktop\\arma_chatbot_config\\vpn\\ovpn") and "openvpn" in n:
-                print(f"[DEBUG] Matched OpenVPN: {title!r}")
+            if n.startswith(vpn_path_match) and "openvpn" in n:
+                print(f"[DEBUG] Matched OpenVPN dynamically: {title!r}")
                 return hwnd
 
     print(f"[DEBUG] No match for: {alias_list}")
@@ -108,9 +113,13 @@ def find_window(alias_list):
 def launch_and_position(aliases, cmd, pos, minimize):
     x, y = pos or (0, 0)
     hwnd = find_window(aliases)
+    
     if hwnd:
         print(f"[REPOSITION] {aliases[0]}; moving to {x},{y}")
-        win32gui.MoveWindow(hwnd, x, y, half_w, half_h, True)
+        try:
+            win32gui.MoveWindow(hwnd, x, y, half_w, half_h, True)
+        except Exception as e:
+            print(f"[WARN] Failed to move window {aliases[0]}: {e}")
         if minimize:
             win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
         return
@@ -129,16 +138,23 @@ def launch_and_position(aliases, cmd, pos, minimize):
         return
 
     print(f"[POSITION] {aliases[0]}; moving to {x},{y}")
-    win32gui.MoveWindow(hwnd, x, y, half_w, half_h, True)
+    try:
+        win32gui.MoveWindow(hwnd, x, y, half_w, half_h, True)
+    except Exception as e:
+        print(f"[WARN] Failed to move window {aliases[0]} after launch: {e}")
     if minimize:
         win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+
 
 def main():
     for aliases, cmd, pos, mini in WINDOWS:
         launch_and_position(aliases, cmd, pos, mini)
 
-    aliases, cmd, pos, mini = UPDATER
-    launch_and_position(aliases, cmd, pos, mini)
+    if ENABLE_UPDATER:
+        aliases, cmd, pos, mini = UPDATER
+        launch_and_position(aliases, cmd, pos, mini)
+    else:
+        print("[INFO] Game Updater is disabled in settings. Skipping.")
 
 if __name__ == "__main__":
     main()

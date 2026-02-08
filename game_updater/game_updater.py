@@ -147,7 +147,7 @@ def main_loop():
         wait_and_continue()
 
 def wait_and_continue():
-    logging.info("Waiting 60 seconds before watching again...")
-    time.sleep(60)
+    logging.info("Waiting 30 seconds before watching again...")
+    time.sleep(30)
 
 main_loop()

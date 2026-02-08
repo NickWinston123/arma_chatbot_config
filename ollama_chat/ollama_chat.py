@@ -12,13 +12,15 @@ import faiss
 import threading
 import configparser
 import logging
-import sys
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def resolve_path(path):
+
+    path = os.path.normpath(path)
     return path if os.path.isabs(path) else os.path.abspath(os.path.join(BASE_DIR, path))
 
 config = configparser.ConfigParser()
@@ -27,12 +29,12 @@ ini_path = os.path.join(BASE_DIR, 'ollama_chat_real.ini')
 try:
     config.read(ini_path)
 
-    CONFIG_FILE             = config.get('Paths', 'config_file')
-    CHAT_LOG_NO_DATA        = config.get('Paths', 'chat_log_no_data')
-    CHAT_LOG_PATH           = config.get('Paths', 'chat_log_path')
-    CONTEXT_BUILDER_DATA    = config.get('Paths', 'context_builder_data')
+    CONFIG_FILE             = os.path.normpath(config.get('Paths', 'config_file'))
+    CHAT_LOG_NO_DATA        = os.path.normpath(config.get('Paths', 'chat_log_no_data'))
+    CHAT_LOG_PATH           = os.path.normpath(config.get('Paths', 'chat_log_path'))
+    CONTEXT_BUILDER_DATA    = os.path.normpath(config.get('Paths', 'context_builder_data'))
     CONTEXT_LAST_LINE_TRACKER = CONTEXT_BUILDER_DATA + ".lastline"
-    OUTPUT_FILE             = config.get('Paths', 'output_file')
+    OUTPUT_FILE             = os.path.normpath(config.get('Paths', 'output_file'))
 
     CONTEXT_DIR             = resolve_path(config.get('Context', 'context_dir'))
     PLAYER_CONTEXT_DIR      = resolve_path(config.get('Context', 'player_context_dir'))
@@ -66,6 +68,7 @@ parameters = {
     "announce_status": False,
     "history_size": 20,
     "ollama_model": "llama3", #openchat #llama2
+    "ollama_timeout_time": 0,
     "clear_history_on_start": False,
     "number_of_lines_to_analyze": 3,
     "parse_file_speed": 1,
@@ -112,6 +115,12 @@ last_used_options = {}
 start_time = time.time()
 initialization_time = None
 history = []
+
+last_known_total_players = None
+last_known_spectators = None
+last_known_spectator_names = []
+
+
 
 def printlog(message):
     print(message)
@@ -215,7 +224,7 @@ def get_value_from_user_config(search_key, config_file=CONFIG_FILE):
             for line in f:
                 parts = line.strip().split(maxsplit=1)
                 if len(parts) == 2 and parts[0] == search_key:
-                    return parts[1].replace("\\", "")
+                    return parts[1].strip('"').strip("'")
     except FileNotFoundError:
         printlog(f"File '{config_file}' not found.")
     except Exception as e:
@@ -282,6 +291,190 @@ def objects_are_different(old_params, new_params):
             return True
     return False
 
+def group_lines_by_speaker_and_chunk(new_lines, max_words=200):
+    timestamped_pattern = re.compile(r'^\[\d{4}/\d{2}/\d{2}-\d{2}:\d{2}:\d{2}\]\s+(.*)$')
+
+    cleaned_lines = []
+    skipped = []
+
+    for i, line in enumerate(new_lines):
+        line = line.strip()
+        if not line:
+            continue
+
+        match = timestamped_pattern.match(line)
+        if match:
+            content = match.group(1).strip()
+        else:
+            content = line  
+
+        if len(content.split()) < 2 or len(content) < 5:
+            skipped.append((i + 1, line))
+        else:
+            cleaned_lines.append(content)
+
+    all_words = []
+    line_accumulator = []
+    final_chunks = []
+
+    for line in cleaned_lines:
+        words = line.split()
+        if not words:
+            continue
+
+        if len(all_words) + len(words) > max_words:
+            chunk = " ".join(line_accumulator).strip()
+            if len(chunk.split()) >= 50:
+                final_chunks.append(chunk)
+            line_accumulator = []
+            all_words = []
+
+        line_accumulator.append(line)
+        all_words.extend(words)
+
+    if line_accumulator:
+        chunk = " ".join(line_accumulator).strip()
+        if len(chunk.split()) >= 50:
+            final_chunks.append(chunk)
+
+    return final_chunks, skipped
+
+def add_to_player_chat_context():
+    
+    os.makedirs(PLAYER_CONTEXT_DIR, exist_ok=True)
+    printlog("🧩 Running incremental FAISS chat update...")
+
+    last_line_path = os.path.join(PLAYER_CONTEXT_DIR, "last_line_index.txt")
+    last_index = 0
+    if os.path.exists(last_line_path):
+        with open(last_line_path, "r") as f:
+            last_index = int(f.read().strip())
+
+    if os.path.exists(PLAYER_FAISS_INDEX):
+        index = faiss.read_index(PLAYER_FAISS_INDEX)
+    else:
+        index = faiss.IndexFlatL2(384)
+
+    if os.path.exists(PLAYER_METADATA):
+        with open(PLAYER_METADATA, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    else:
+        metadata = []
+
+    with open(CHAT_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+        all_lines = f.readlines()
+
+    new_lines = all_lines[last_index:]
+    printlog(f"📈 Lines in chatlog: {len(all_lines)} | New lines: {len(new_lines)}")
+
+    grouped, skipped = group_lines_by_speaker_and_chunk(new_lines)
+
+    printlog(f"🧠 Created {len(grouped)} new speaker chunks (incremental update)")
+
+    if skipped:
+        printlog(f"⚠️ Skipped {len(skipped)} malformed line(s):")
+        for ln, content in skipped[:10]:
+            printlog(f"  [Line {ln}] {content}")
+        if len(skipped) > 10:
+            printlog(f"  ... and {len(skipped) - 10} more")
+
+    if not grouped:
+        printlog("⚠️ No new lines to embed.")
+        return
+
+    printlog("🚀 Generating embeddings...")
+    embeddings = EMBED_MODEL.encode(grouped, show_progress_bar=True)
+
+    index.add(embeddings)
+    for chunk in grouped:
+        metadata.append({
+            "chunk_id": len(metadata),
+            "text": chunk
+        })
+
+    faiss.write_index(index, PLAYER_FAISS_INDEX)
+    with open(PLAYER_METADATA, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+    with open(last_line_path, "w") as f:
+        f.write(str(len(all_lines)))
+
+    printlog("✅ Incremental context update complete.")
+
+def update_player_chat_context(bypass_flag=False):
+    
+    global last_chat_line_index
+    printlog(f"📌 Writing to actual resolved paths:\n - index: {os.path.abspath(PLAYER_FAISS_INDEX)}\n - metadata: {os.path.abspath(PLAYER_METADATA)}")
+
+    if not parameters.get("build_chat_context", False) and not bypass_flag:
+        printlog("🚫 Skipping: build_chat_context is False.")
+        return
+
+    os.makedirs(PLAYER_CONTEXT_DIR, exist_ok=True)
+
+    if os.path.exists(PLAYER_FAISS_INDEX):
+        index = faiss.read_index(PLAYER_FAISS_INDEX)
+    else:
+        index = faiss.IndexFlatL2(384)
+
+    if os.path.exists(PLAYER_METADATA):
+        with open(PLAYER_METADATA, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    else:
+        metadata = []
+
+    with open(CHAT_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+
+    new_lines = lines[last_chat_line_index:]
+    printlog(f"📑 Total chat log lines: {len(lines)} | New lines: {len(new_lines)}")
+
+    grouped, skipped = group_lines_by_speaker_and_chunk(new_lines)
+
+    printlog(f"🧠 Created {len(grouped)} speaker chunks from full rebuild")
+
+    if skipped:
+        printlog(f"⚠️ Skipped {len(skipped)} malformed line(s):")
+        for ln, content in skipped[:10]:
+            printlog(f"  [Line {ln}] {content}")
+        if len(skipped) > 10:
+            printlog(f"  ... and {len(skipped) - 10} more")
+
+    if grouped:
+        embeddings = EMBED_MODEL.encode(grouped, show_progress_bar=True)
+        index.add(embeddings)
+        for chunk in grouped:
+            metadata.append({
+                "chunk_id": len(metadata),
+                "text": chunk
+            })
+
+        faiss.write_index(index, PLAYER_FAISS_INDEX)
+        with open(PLAYER_METADATA, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+
+        printlog(f"📥 Added {len(grouped)} new player chat(s) to RAG index.")
+    else:
+        printlog("⚠️ No new chat chunks to add.")
+
+    last_chat_line_index += len(new_lines)
+    printlog(f"📈 Updated last_chat_line_index to: {last_chat_line_index}")
+
+    printlog("✅ Player chat context update complete.")
+
+def reload_player_chat_context():
+    try:
+        if os.path.exists(PLAYER_FAISS_INDEX) and os.path.exists(PLAYER_METADATA):
+            faiss_index = faiss.read_index(PLAYER_FAISS_INDEX)
+            with open(PLAYER_METADATA, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            loaded_contexts["player_chats"] = (faiss_index, metadata)
+            printlog("🔁 Reloaded 'player_chats' context.")
+        else:
+            printlog("⚠️ Player chat FAISS index or metadata not found. Skipping reload.")
+    except Exception as e:
+        printlog(f"❌ Failed to reload player chat context: {e}")
+   
 def infer_type(value):
     if value.lower() == 'true':
         return True
@@ -352,7 +545,7 @@ def extract_parameters(announce_params = False, compare_to_last_used_options=Tru
         if parameters["dynamic_name"]:
             temp_params = parameters.copy()
             temp_params["bot_name"] = bot_name
-            printlog("\nCurrent parameters: " + json.dumps(temp_params, indent=4))
+            printlog("\nCurrent parameters:\n" + json.dumps(temp_params, indent=4))
 
 def send_to_ollama(message):
     global initialization_time, announce_status, last_used_options
@@ -368,15 +561,12 @@ def send_to_ollama(message):
 
     payload = {
         "model": parameters["ollama_model"],
-        "stream": False
+        "stream": False,
+        "messages": history + [{"role": "user", "content": message}],
+        "options": exactract_options(OPTIONS_FILE)
     }
-
-    payload["messages"] = history + [{"role": "user", "content": message}]
-
     # https://github.com/jmorganca/ollama/blob/main/docs/modelfile.md#valid-parameters-and-values
 
-    payload["options"] = exactract_options(OPTIONS_FILE)
- 
     if last_used_options == {}:
         last_used_options = payload["options"].copy()
     elif objects_are_different(last_used_options, payload["options"]):
@@ -402,14 +592,23 @@ def send_to_ollama(message):
 
     printlog(f"\nSending {'chat' if chat_mode else 'event'} input to Ollama. ({parameters['ollama_model']})")
 
-    response = requests.post(ollama_url_chat, json=payload)
+    raw_timeout = parameters.get("ollama_timeout_time", 0)
+    
+    if raw_timeout == 0 or str(raw_timeout).lower() == "none":
+        timeout_val = None
+    else:
+        timeout_val = float(raw_timeout)
 
     try:
+        response = requests.post(ollama_url_chat, json=payload, timeout=timeout_val)
         return response.json()
+    except requests.exceptions.RequestException as e:
+        printlog(f"Request to Ollama failed: {e}")
+        return None
     except json.JSONDecodeError as e:
         printlog(f"JSON parsing error: {e}")
         printlog(f"Raw response: {response.text}")
-        return None  
+        return None
 
 def cleanse_text(command, text):
     text = text.replace('\r\n', '\n').replace('\n', ' ')
@@ -518,9 +717,9 @@ def output_response(command, response, bypass_processing=False):
         output_lines.append(line)
 
     if parameters.get("chatbot_processing", False) and parameters.get("local_mode", False):
-        output_lines.append(f'DELAY_COMMAND {last_delay:.2f} SET_ALL_CHATTING 0')
+        output_lines.append(f'DELAY_COMMAND {last_delay+.1:.2f} SET_ALL_CHATTING 0')
 
-    printlog("Sending commands to OUTPUT_FILE: " + "\n".join(output_lines) )
+    printlog("Sending commands to OUTPUT_FILE: \n" + "\n".join(output_lines) )
     with open(OUTPUT_FILE, 'a', encoding='utf-8') as file:
         file.write("\n".join(output_lines) + "\n")
 
@@ -528,6 +727,7 @@ def output_response(command, response, bypass_processing=False):
         printlog(f"\nDone processing. ({time.time() - initialization_time:.2f} seconds elapsed for the entire process)")
 
 def parse_setting_change(command):
+    global history
     """
     ─────────────────────────────────────────────────────────────
     EXAMPLES
@@ -560,6 +760,16 @@ def parse_setting_change(command):
         return {}
 
     cmd = tokens[0].lower()
+
+    if cmd == "reset_history":
+        load_context_builder_lines()
+        history = get_default_history()
+        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(history, f, indent=4)
+        msg = "History cleared."
+        printlog(" 🔁" + msg)
+        output_response(command, msg, bypass_processing=True)
+        return {}  
 
     def parse_names(seq):
         if not seq:
@@ -690,12 +900,12 @@ def apply_context_builder(input_text: str) -> str:
     limited_context = context_lines[-max_lines:]
     context_block = "\n".join(limited_context)
 
-    printlog(f"\n📚 Injecting {len(limited_context)} context builder line(s):\n{context_block}")
+    printlog(f"\n📚 Injecting {len(limited_context)} context builder line(s)")#:\n{context_block}")
 
     return (
         f"{parameters.get('context_builder_prompt', '')}\n"
         f"{context_block}\n"
-        f"{parameters.get('context_builder_prompt_post', '')}\n"
+        f"\n{parameters.get('context_builder_prompt_post', '')}\n"
         f"{input_text}"
     )
 
@@ -712,7 +922,7 @@ def apply_rag(input_text: str) -> str:
         return input_text
 
     rag_context = "\n\n".join(f"[{ctx}] {text}" for ctx, text, _ in matches)
-    printlog("\n📚 Injecting RAG context:\n" + rag_context)
+    printlog("\n📚 Injecting RAG context")#:\n" + rag_context)
 
     return (
         f"{input_text}\n\n"
@@ -720,40 +930,90 @@ def apply_rag(input_text: str) -> str:
         f"{rag_context}"
     )
 
-def process_line(line) -> bool:
-    global history
+def should_process_line(line: str) -> bool:
+    return process_line(line, dry_run=True)
+
+
+def process_line(line, dry_run=False) -> bool:
+    global history, last_known_total_players, last_known_spectators, last_known_spectator_names
+
     processing_reason = None
     smart_override = False
 
+    line = line.strip()
+
+    if "*==settingchange==*" in line:
+        updates = parse_setting_change(line)
+        if updates:
+            update_params_file(PARAMS_FILE, updates)
+            extract_parameters()
+            printlog("🔧 Line processed due to setting change.")
+        return True
+
+    sender, _, rest = line.partition(':')
+    rest = rest.lstrip()
+
+    if not rest.strip():
+        printlog(f"❌ Skipping line: {line} — Message is empty.")
+        return False
+
+
     if parameters.get("smart_processor", False):
         try:
+            global last_known_total_players, last_known_spectators, last_known_spectator_names
+
             context_lines = load_context_builder_lines(update_tracker=False)
             for cline in reversed(context_lines):
                 if "Round ended." in cline or "Round started." in cline:
-                    match_total = re.search(r'Player Count: (\d+)', cline)
-                    match_specs = re.search(r'Spectator Count: (\d+)', cline)
-                    if match_total and match_specs:
+                    match_total      = re.search(r'Player Count: (\d+)', cline)
+                    match_specs      = re.search(r'Spectator Count: (\d+)', cline)
+                    match_spec_names = re.search(r'Spectator Count: \d+ \(([^)]+)\)', cline)
+
+                    total = specs = None
+                    spectators = []
+
+                    if match_total:
                         total = int(match_total.group(1))
+                        last_known_total_players = total
+
+                    if match_specs:
                         specs = int(match_specs.group(1))
+                        last_known_spectators = specs
+
+                    if match_spec_names:
+                        spectators = [name.strip().lower() for name in match_spec_names.group(1).split(',')]
+                        last_known_spectator_names = spectators
+
+                    if total is None and last_known_total_players is not None:
+                        total = last_known_total_players
+                    if specs is None and last_known_spectators is not None:
+                        specs = last_known_spectators
+                    if not spectators:
+                        spectators = last_known_spectator_names
+
+                    if total is not None and specs is not None:
                         active = total - specs
                         threshold = parameters.get("smart_processor_active_players", 1)
-                        if active <= threshold:
+                        normalized_sender = sender.strip().lower()
+
+                        if normalized_sender not in spectators and active <= threshold:
                             smart_override = True
-                            processing_reason = f"Smart override (active={active} <= threshold={threshold})"
+                            processing_reason = f"Smart override (active={active} <= threshold={threshold}, sender={normalized_sender} not in spectators)"
                             printlog(f"🔓 SMART OVERRIDE ACTIVE — {processing_reason}")
                         else:
-                            printlog(f"🚫 SMART OVERRIDE SKIPPED (active={active}, threshold={threshold})")
+                            printlog(f"🚫 SMART OVERRIDE SKIPPED (active={active}, threshold={threshold}, sender={normalized_sender}, spectators={spectators})")
+                    else:
+                        printlog(f"⚠️ Skipped smart processor evaluation — could not determine total/specs. Last known: total={last_known_total_players}, specs={last_known_spectators}")
                     break
         except Exception as e:
             printlog(f"⚠️ Smart processor failed to parse context lines: {e}")
 
-    line = line.lstrip()
 
     if "-->" in line[:35]:
         colon_index = line.find(":")
         if colon_index != -1:
             content = line[colon_index + 1:].strip().lower()
-            has_keyword = any(keyword.lower() in content for keyword in parameters.get("process_lines_containing", []))
+            has_keyword = any(keyword.lower() in rest.lower() for keyword in parameters.get("process_lines_containing", []))
             has_prefix = any(content.startswith(pref.lower()) for pref in parameters.get("command_prefix", []))
             if not (has_keyword or has_prefix):
                 return False
@@ -761,21 +1021,7 @@ def process_line(line) -> bool:
     if line.startswith("*EVENT"):
         processing_reason = "Event line"
         ollama_input = line
-
     else:
-        if "*==settingchange==*" in line:
-            updates = parse_setting_change(line)
-            if updates:
-                update_params_file(PARAMS_FILE, updates)
-                extract_parameters()
-                printlog("🔧 Line processed due to setting change.")
-            return True
-
-        if ':' not in line:
-            return False
-
-        sender, _, rest = line.partition(':')
-        rest = rest.lstrip()
 
         if sender.lower() == bot_name.lower() or sender in parameters.get("ignored_names", []):
             return False
@@ -791,26 +1037,18 @@ def process_line(line) -> bool:
             if substr.lower() in lw:
                 return False
 
-        if ": !!reset" in line:
-            extract_parameters()
-            history = get_default_history()
-            with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-                json.dump(history, f, indent=4)
-            output_response(line, "History cleared.", bypass_processing=True)
-            printlog("🔁 History reset command processed.")
-            return True
-
         if parameters.get("process_all_lines", False):
             processing_reason = "process_all_lines is enabled"
             ollama_input = line
         elif sender in parameters.get("always_processed_players", []):
             processing_reason = f"Sender '{sender}' is in always_processed_players"
             ollama_input = line
-        elif any(keyword.lower() in line.lower() for keyword in parameters.get("process_lines_containing", [])):
+        elif any(keyword.lower() in rest.lower() for keyword in parameters.get("process_lines_containing", [])):
             processing_reason = "Matched keyword in process_lines_containing"
             ollama_input = line
         elif smart_override:
-            ollama_input = line 
+            processing_reason = processing_reason or "Smart override is active"
+            ollama_input = line
         else:
             matched = None
             for pref in parameters.get("command_prefix", []):
@@ -822,33 +1060,47 @@ def process_line(line) -> bool:
                 msg = rest[len(matched):].lstrip()
                 ollama_input = f"{sender}: {msg}"
             else:
+                printlog(f"❌ Skipping line: {line} — No matching keyword or command prefix.")
                 return False
 
     if processing_reason:
+        if dry_run:
+            return True
         printlog(f"✅ Line is being processed because: {processing_reason}")
+
+    if dry_run:
+        return True
 
     ollama_input = apply_context_builder(ollama_input)
     ollama_input = apply_rag(ollama_input)
 
-    printlog("🔷Final ollama_input:\n" + ollama_input)
+    printlog("\n🔷Final ollama_input:\n" + ollama_input)
 
     response = send_to_ollama(ollama_input)
     chat_mode = not ollama_input.startswith("*EVENT")
 
+    if not response:
+        printlog("Failed to get response from Ollama.")
+        return  
+
     if parameters.get("announce_status", False):
         printlog("Got Response:\n" + json.dumps(response, indent=4))
 
-    ollama_response = response.get('message', {}).get('content', "No response")
+    ollama_response    = response.get('message', {}).get('content', "No response")
     tokens_in_prompt   = response.get('prompt_eval_count', 0)
     tokens_in_response = response.get('eval_count',        0)
-    total_s = response.get('total_duration', 0) / 1_000_000_000
+    total_s            = response.get('total_duration', 0) / 1_000_000_000
 
+    
+    clean_response = ollama_response.replace('\r\n', '\n').replace('\n', ' ')
+
+    
     printlog(
         f"\nProcess complete\n"
         f" - total duration:     {total_s}\n"
         f" - tokens in prompt:   {tokens_in_prompt}\n"
         f" - tokens in response: {tokens_in_response}\n"
-        f" - response:           {ollama_response.replace('\r\n', '\n').replace('\n', ' ')}"
+        f" - response:           {clean_response}"
     )
 
     if chat_mode:
@@ -861,218 +1113,9 @@ def process_line(line) -> bool:
     return True
 
 MAX_WORDS = 200
-
-def group_lines_by_speaker_and_chunk(new_lines, max_words=200):
-    timestamped_pattern = re.compile(r'^\[\d{4}/\d{2}/\d{2}-\d{2}:\d{2}:\d{2}\]\s+(.*)$')
-
-    cleaned_lines = []
-    skipped = []
-
-    for i, line in enumerate(new_lines):
-        line = line.strip()
-        if not line:
-            continue
-
-        match = timestamped_pattern.match(line)
-        if match:
-            content = match.group(1).strip()
-        else:
-            content = line  
-
-        if len(content.split()) < 2 or len(content) < 5:
-            skipped.append((i + 1, line))
-        else:
-            cleaned_lines.append(content)
-
-    all_words = []
-    line_accumulator = []
-    final_chunks = []
-
-    for line in cleaned_lines:
-        words = line.split()
-        if not words:
-            continue
-
-        if len(all_words) + len(words) > max_words:
-            chunk = " ".join(line_accumulator).strip()
-            if len(chunk.split()) >= 50:
-                final_chunks.append(chunk)
-            line_accumulator = []
-            all_words = []
-
-        line_accumulator.append(line)
-        all_words.extend(words)
-
-    if line_accumulator:
-        chunk = " ".join(line_accumulator).strip()
-        if len(chunk.split()) >= 50:
-            final_chunks.append(chunk)
-
-    return final_chunks, skipped
-
-
-def add_to_player_chat_context():
     
-    os.makedirs(PLAYER_CONTEXT_DIR, exist_ok=True)
-    printlog("🧩 Running incremental FAISS chat update...")
-
-    last_line_path = os.path.join(PLAYER_CONTEXT_DIR, "last_line_index.txt")
-    last_index = 0
-    if os.path.exists(last_line_path):
-        with open(last_line_path, "r") as f:
-            last_index = int(f.read().strip())
-
-    if os.path.exists(PLAYER_FAISS_INDEX):
-        index = faiss.read_index(PLAYER_FAISS_INDEX)
-    else:
-        index = faiss.IndexFlatL2(384)
-
-    if os.path.exists(PLAYER_METADATA):
-        with open(PLAYER_METADATA, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
-    else:
-        metadata = []
-
-    with open(CHAT_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
-        all_lines = f.readlines()
-
-    new_lines = all_lines[last_index:]
-    printlog(f"📈 Lines in chatlog: {len(all_lines)} | New lines: {len(new_lines)}")
-
-    grouped, skipped = group_lines_by_speaker_and_chunk(new_lines)
-
-    printlog(f"🧠 Created {len(grouped)} new speaker chunks (incremental update)")
-
-    if skipped:
-        printlog(f"⚠️ Skipped {len(skipped)} malformed line(s):")
-        for ln, content in skipped[:10]:
-            printlog(f"  [Line {ln}] {content}")
-        if len(skipped) > 10:
-            printlog(f"  ... and {len(skipped) - 10} more")
-
-    if not grouped:
-        printlog("⚠️ No new lines to embed.")
-        return
-
-    printlog("🚀 Generating embeddings...")
-    embeddings = EMBED_MODEL.encode(grouped, show_progress_bar=True)
-
-    index.add(embeddings)
-    for chunk in grouped:
-        metadata.append({
-            "chunk_id": len(metadata),
-            "text": chunk
-        })
-
-    faiss.write_index(index, PLAYER_FAISS_INDEX)
-    with open(PLAYER_METADATA, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
-
-    with open(last_line_path, "w") as f:
-        f.write(str(len(all_lines)))
-
-    printlog("✅ Incremental context update complete.")
-
-
-
-def update_player_chat_context(bypass_flag=False):
-    
-    global last_chat_line_index
-    printlog(f"📌 Writing to actual resolved paths:\n - index: {os.path.abspath(PLAYER_FAISS_INDEX)}\n - metadata: {os.path.abspath(PLAYER_METADATA)}")
-
-    if not parameters.get("build_chat_context", False) and not bypass_flag:
-        printlog("🚫 Skipping: build_chat_context is False.")
-        return
-
-    os.makedirs(PLAYER_CONTEXT_DIR, exist_ok=True)
-
-    if os.path.exists(PLAYER_FAISS_INDEX):
-        index = faiss.read_index(PLAYER_FAISS_INDEX)
-    else:
-        index = faiss.IndexFlatL2(384)
-
-    if os.path.exists(PLAYER_METADATA):
-        with open(PLAYER_METADATA, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
-    else:
-        metadata = []
-
-    with open(CHAT_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
-        lines = f.readlines()
-
-    new_lines = lines[last_chat_line_index:]
-    printlog(f"📑 Total chat log lines: {len(lines)} | New lines: {len(new_lines)}")
-
-    grouped, skipped = group_lines_by_speaker_and_chunk(new_lines)
-
-    printlog(f"🧠 Created {len(grouped)} speaker chunks from full rebuild")
-
-    if skipped:
-        printlog(f"⚠️ Skipped {len(skipped)} malformed line(s):")
-        for ln, content in skipped[:10]:
-            printlog(f"  [Line {ln}] {content}")
-        if len(skipped) > 10:
-            printlog(f"  ... and {len(skipped) - 10} more")
-
-    if grouped:
-        embeddings = EMBED_MODEL.encode(grouped, show_progress_bar=True)
-        index.add(embeddings)
-        for chunk in grouped:
-            metadata.append({
-                "chunk_id": len(metadata),
-                "text": chunk
-            })
-
-        faiss.write_index(index, PLAYER_FAISS_INDEX)
-        with open(PLAYER_METADATA, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
-
-        printlog(f"📥 Added {len(grouped)} new player chat(s) to RAG index.")
-    else:
-        printlog("⚠️ No new chat chunks to add.")
-
-    last_chat_line_index += len(new_lines)
-    printlog(f"📈 Updated last_chat_line_index to: {last_chat_line_index}")
-
-    printlog("✅ Player chat context update complete.")
-
-def reload_player_chat_context():
-    try:
-        if os.path.exists(PLAYER_FAISS_INDEX) and os.path.exists(PLAYER_METADATA):
-            faiss_index = faiss.read_index(PLAYER_FAISS_INDEX)
-            with open(PLAYER_METADATA, "r", encoding="utf-8") as f:
-                metadata = json.load(f)
-            loaded_contexts["player_chats"] = (faiss_index, metadata)
-            printlog("🔁 Reloaded 'player_chats' context.")
-        else:
-            printlog("⚠️ Player chat FAISS index or metadata not found. Skipping reload.")
-    except Exception as e:
-        printlog(f"❌ Failed to reload player chat context: {e}")
-
-
-def start_background_chat_context_loop():
-    def loop():
-        while True:
-            printlog("🧪 Chat context background loop running...")
-            extract_parameters()
-            printlog(f"📌 build_chat_context is: {parameters.get('build_chat_context', False)}")
-
-            if parameters.get("build_chat_context", False):
-                printlog("➡️ Calling add_to_player_chat_context()")
-                add_to_player_chat_context()
-                printlog("➡️ Calling reload_player_chat_context()")
-                reload_player_chat_context()
-            else:
-                printlog("⛔ build_chat_context is false. Skipping context build.")
-
-            time.sleep(parameters.get("build_chat_context_interval", 15))
-
-
-    thread = threading.Thread(target=loop, daemon=True)
-    thread.start()
-       
 def initialize():
-    global last_used_options, last_chat_line_index 
+    global last_used_options, last_chat_line_index, history
 
     printlog(f"{header_bar}\n{get_timestamp()}Process started.")
 
@@ -1103,13 +1146,13 @@ def initialize():
         history = extract_history()
         printlog(f'\nLoaded history from {HISTORY_FILE}. Number of items: {len(history)-len(default_history)}/{parameters["history_size"]}')
 
-
     with open(CHAT_LOG_NO_DATA, 'w') as file:
         pass  
         
     printlog(f"\n{header_bar}\n")
 
 def main():
+    global history
     last_offset = 0
     last_processed_time = time.time()
     last_wait_time = None
@@ -1117,7 +1160,6 @@ def main():
     initialize()
     if parameters.get("build_chat_context", False):
         add_to_player_chat_context()
-    #start_background_chat_context_loop()
 
     while True:
         try:
@@ -1136,13 +1178,33 @@ def main():
             last_offset = f.tell()
 
         for line in new_lines:
-
             if line.startswith("*==settingchange==*"):
                 printlog(f"\n{header_bar}\n{get_timestamp()}Processing setting change:\n{line}")
                 process_line(line)
                 last_processed_time = time.time()
-                continue
-            
+
+        max_lines = parameters.get("number_of_lines_to_analyze", 0)
+        processable_lines = []
+
+        if max_lines > 0:
+            for line in reversed(new_lines):
+                if line.startswith("*==settingchange==*"):
+                    continue 
+                if should_process_line(line):
+                    processable_lines.append(line)
+                if len(processable_lines) >= max_lines:
+                    break
+            processable_lines.reverse()  
+        else:
+            processable_lines = new_lines
+
+        #printlog(f"🧠 Processing {len(processable_lines)} qualifying lines out of {len(new_lines)} total lines.")
+
+       
+        for line in processable_lines:
+            if line.startswith("*==settingchange==*"):
+                continue  
+
             extract_parameters()
             printlog(f"\n{header_bar}\n{get_timestamp()}Processing line:\n{line}")
             handled = process_line(line)

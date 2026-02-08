@@ -1,4 +1,25 @@
-.git
-.gitignore
+.bzr/
+.bzrignore
 VPN/OVPN
+
+.bzr
+.bzrignore
+.git/
+.gitignore
+
+# Ignore all files in OTHER/
+OTHER/
+
+# Ignore specific files in VPN/
+VPN/OVPN
+VPN/launch.bat
 VPN/mycredentials.txt
+
+# Ignore all *_real.ini files (any folder)
+*_real.ini
+
+# Ignore all *_log.txt files (any folder)
+*_log.txt
+
+# Ignore root launch.bat
+launch.bat
